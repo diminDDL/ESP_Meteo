@@ -1,0 +1,6 @@
+#pragma once
+
+#define THINKSPEAK_API_KEY  "YOUR_THINKSPEAK_API_KEY"
+#define WIFI_SSID           "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"
+
