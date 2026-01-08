@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <string.h>
 #include "sdkconfig.h"
@@ -12,6 +13,8 @@
 #include "esp_netif.h"
 #include "esp_sleep.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_task_wdt.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 
@@ -37,6 +40,48 @@
 
 static const char *TAG = "ESP_Meteo";
 
+// Debug / power flags (compile-time)
+// - When DEBUG_ENABLE_OUTPUT=0, all printf/ESP_LOG* are disabled in this file.
+// - When DEBUG_LED_SOLID_ON=1, the LED stays ON while the device is awake.
+//   When DEBUG_LED_SOLID_ON=0, the LED is kept OFF (no blinking).
+#ifndef DEBUG_ENABLE_OUTPUT
+#define DEBUG_ENABLE_OUTPUT 0
+#endif
+
+#ifndef DEBUG_LED_SOLID_ON
+#define DEBUG_LED_SOLID_ON 0
+#endif
+
+#if DEBUG_ENABLE_OUTPUT
+#define DBG_PRINTF(...)            printf(__VA_ARGS__)
+#define DBG_LOGI(tag, fmt, ...)    ESP_LOGI(tag, fmt, ##__VA_ARGS__)
+#define DBG_LOGW(tag, fmt, ...)    ESP_LOGW(tag, fmt, ##__VA_ARGS__)
+#define DBG_LOGE(tag, fmt, ...)    ESP_LOGE(tag, fmt, ##__VA_ARGS__)
+#else
+#define DBG_PRINTF(...)            do { } while (0)
+#define DBG_LOGI(tag, fmt, ...)    do { } while (0)
+#define DBG_LOGW(tag, fmt, ...)    do { } while (0)
+#define DBG_LOGE(tag, fmt, ...)    do { } while (0)
+#endif
+
+#define TRY_RETURN(expr)                               \
+    do {                                               \
+        esp_err_t __e = (expr);                        \
+        if (__e != ESP_OK) {                           \
+            DBG_LOGW(TAG, "%s failed: %s", #expr, esp_err_to_name(__e)); \
+            return __e;                                \
+        }                                              \
+    } while (0)
+
+#define TRY_GOTO(expr, label)                          \
+    do {                                               \
+        esp_err_t __e = (expr);                        \
+        if (__e != ESP_OK) {                           \
+            DBG_LOGW(TAG, "%s failed: %s", #expr, esp_err_to_name(__e)); \
+            goto label;                                \
+        }                                              \
+    } while (0)
+
 static volatile bool s_wifi_connected = false;
 
 static adc_oneshot_unit_handle_t s_adc_handle = NULL;
@@ -50,13 +95,21 @@ static esp_err_t adc_gpio0_init(void)
         .unit_id = ADC1_UNIT,
         .ulp_mode = ADC_ULP_MODE_DISABLE,
     };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &s_adc_handle));
+    esp_err_t err = adc_oneshot_new_unit(&unit_cfg, &s_adc_handle);
+    if (err != ESP_OK) {
+        return err;
+    }
 
     adc_oneshot_chan_cfg_t chan_cfg = {
         .atten = ADC1_CH0_ATTEN,
         .bitwidth = ADC1_BITWIDTH,
     };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc_handle, ADC1_CH0_CHANNEL, &chan_cfg));
+    err = adc_oneshot_config_channel(s_adc_handle, ADC1_CH0_CHANNEL, &chan_cfg);
+    if (err != ESP_OK) {
+        (void)adc_oneshot_del_unit(s_adc_handle);
+        s_adc_handle = NULL;
+        return err;
+    }
 
     s_adc_cali_enabled = false;
 
@@ -82,10 +135,10 @@ static esp_err_t adc_gpio0_init(void)
 #endif
 
     if (!s_adc_cali_enabled) {
-        ESP_LOGW(TAG, "ADC calibration not available; only raw readings will be shown");
+        DBG_LOGW(TAG, "ADC calibration not available; only raw readings will be shown");
     }
 
-    ESP_LOGI(TAG, "ADC ready: GPIO%d (ADC1_CH0), atten=%d", (int)ADC1_CH0_GPIO, (int)ADC1_CH0_ATTEN);
+    DBG_LOGI(TAG, "ADC ready: GPIO%d (ADC1_CH0), atten=%d", (int)ADC1_CH0_GPIO, (int)ADC1_CH0_ATTEN);
     return ESP_OK;
 }
 
@@ -144,23 +197,72 @@ static esp_err_t adc_gpio0_read_voltage_mv(int *out_mv, int *out_raw)
     return ESP_OK;
 }
 
-static esp_err_t thingspeak_send_readings(float temperature_c, float humidity_pct, float pressure_hpa, float battery_v)
+static esp_err_t url_append(char *buf, size_t buf_size, size_t *offset, const char *fmt, ...)
 {
-    // Convert hPa -> mmHg
-    const float pressure_mmhg = pressure_hpa * 0.750061683f;
+    if (buf == NULL || offset == NULL || fmt == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (*offset >= buf_size) {
+        return ESP_ERR_INVALID_SIZE;
+    }
 
+    va_list ap;
+    va_start(ap, fmt);
+    int written = vsnprintf(buf + *offset, buf_size - *offset, fmt, ap);
+    va_end(ap);
+
+    if (written < 0 || (size_t)written >= (buf_size - *offset)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    *offset += (size_t)written;
+    return ESP_OK;
+}
+
+static esp_err_t thingspeak_send_readings_optional(
+    const float *temperature_c,
+    const float *humidity_pct,
+    const float *pressure_hpa,
+    const float *battery_v)
+{
     char url[256];
-    int written = snprintf(
+    size_t off = 0;
+
+    esp_err_t err = url_append(
         url,
         sizeof(url),
-        "https://api.thingspeak.com/update?api_key=%s&field1=%.2f&field2=%.2f&field3=%.2f&field8=%.2f",
-        THINKSPEAK_API_KEY,
-        temperature_c,
-        humidity_pct,
-        pressure_mmhg,
-        battery_v);
-    if (written < 0 || written >= (int)sizeof(url)) {
-        return ESP_ERR_INVALID_SIZE;
+        &off,
+        "https://api.thingspeak.com/update?api_key=%s",
+        THINKSPEAK_API_KEY);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (temperature_c != NULL) {
+        err = url_append(url, sizeof(url), &off, "&field1=%.2f", *temperature_c);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+    if (humidity_pct != NULL) {
+        err = url_append(url, sizeof(url), &off, "&field2=%.2f", *humidity_pct);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+    if (pressure_hpa != NULL) {
+        // Convert hPa -> mmHg
+        const float pressure_mmhg = (*pressure_hpa) * 0.750061683f;
+        err = url_append(url, sizeof(url), &off, "&field3=%.2f", pressure_mmhg);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+    if (battery_v != NULL) {
+        err = url_append(url, sizeof(url), &off, "&field8=%.2f", *battery_v);
+        if (err != ESP_OK) {
+            return err;
+        }
     }
 
     esp_http_client_config_t config = {
@@ -173,7 +275,7 @@ static esp_err_t thingspeak_send_readings(float temperature_c, float humidity_pc
     };
 
 #if !CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
-    ESP_LOGW(TAG, "ThingSpeak HTTPS needs CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y (see sdkconfig.defaults)");
+    DBG_LOGW(TAG, "ThingSpeak HTTPS needs CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y (see sdkconfig.defaults)");
     return ESP_ERR_INVALID_STATE;
 #endif
 
@@ -182,13 +284,18 @@ static esp_err_t thingspeak_send_readings(float temperature_c, float humidity_pc
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "ThingSpeak: GET %s", url);
-    esp_err_t err = esp_http_client_perform(client);
+    DBG_LOGI(TAG, "ThingSpeak: GET %s", url);
+    err = esp_http_client_perform(client);
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
-        ESP_LOGI(TAG, "ThingSpeak: status=%d", status);
+        if (status == 200) {
+            DBG_LOGI(TAG, "ThingSpeak: status=%d", status);
+        } else {
+            DBG_LOGW(TAG, "ThingSpeak: HTTP status=%d", status);
+            err = ESP_FAIL;
+        }
     } else {
-        ESP_LOGW(TAG, "ThingSpeak: request failed: %s", esp_err_to_name(err));
+        DBG_LOGW(TAG, "ThingSpeak: request failed: %s", esp_err_to_name(err));
     }
 
     esp_http_client_cleanup(client);
@@ -201,20 +308,20 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     (void)event_data;
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        ESP_LOGI(TAG, "Wi-Fi: STA start, connecting...");
+        DBG_LOGI(TAG, "Wi-Fi: STA start, connecting...");
         esp_err_t err = esp_wifi_connect();
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+            DBG_LOGW(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
         }
         return;
     }
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_wifi_connected = false;
-        ESP_LOGW(TAG, "Wi-Fi: disconnected, reconnecting...");
+        DBG_LOGW(TAG, "Wi-Fi: disconnected, reconnecting...");
         esp_err_t err = esp_wifi_connect();
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+            DBG_LOGW(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
         }
         return;
     }
@@ -222,7 +329,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)event_data;
         s_wifi_connected = true;
-        ESP_LOGI(TAG, "Wi-Fi: got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        DBG_LOGI(TAG, "Wi-Fi: got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         return;
     }
 }
@@ -231,20 +338,36 @@ static esp_err_t wifi_init_sta_from_secret(void)
 {
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
+        TRY_RETURN(nvs_flash_erase());
         err = nvs_flash_init();
     }
-    ESP_ERROR_CHECK(err);
+    if (err != ESP_OK) {
+        return err;
+    }
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    (void)esp_netif_create_default_wifi_sta();
+    TRY_RETURN(esp_netif_init());
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        return err;
+    }
+    if (esp_netif_create_default_wifi_sta() == NULL) {
+        return ESP_FAIL;
+    }
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    err = esp_wifi_init(&cfg);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        return err;
+    }
 
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+    err = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        return err;
+    }
+    err = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        return err;
+    }
 
     wifi_config_t wifi_config = { 0 };
     strncpy((char *)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid));
@@ -254,21 +377,16 @@ static esp_err_t wifi_init_sta_from_secret(void)
     wifi_config.sta.pmf_cfg.capable = true;
     wifi_config.sta.pmf_cfg.required = false;
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    TRY_RETURN(esp_wifi_set_mode(WIFI_MODE_STA));
+    TRY_RETURN(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    TRY_RETURN(esp_wifi_start());
 
-    ESP_LOGI(TAG, "Wi-Fi init done (SSID=%s)", WIFI_SSID);
+    DBG_LOGI(TAG, "Wi-Fi init done (SSID=%s)", WIFI_SSID);
     return ESP_OK;
 }
 
-void app_main() {
-    usleep(1000000);  // 1000ms delay to allow for any initial setup
-
-    // Start Wi-Fi (event-driven; no user-created FreeRTOS tasks/event groups)
-    ESP_ERROR_CHECK(wifi_init_sta_from_secret());
-
-    // Configure LED GPIO as output
+static void led_init_set_awake_state(void)
+{
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << LED_GPIO),
         .mode = GPIO_MODE_OUTPUT,
@@ -276,8 +394,115 @@ void app_main() {
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    
-    gpio_config(&io_conf);
+    (void)gpio_config(&io_conf);
+
+    // No blinking in low-power mode.
+    gpio_set_level(LED_GPIO, DEBUG_LED_SOLID_ON ? 1 : 0);
+}
+
+static void bme280_read_avg(
+    bme280_handle_t bme280,
+    int samples,
+    uint32_t inter_sample_delay_ms,
+    float *out_temperature_c,
+    bool *out_ok_temp,
+    float *out_humidity_pct,
+    bool *out_ok_hum,
+    float *out_pressure_hpa,
+    bool *out_ok_press)
+{
+    float sum_t = 0.0f;
+    float sum_h = 0.0f;
+    float sum_p = 0.0f;
+    int cnt_t = 0;
+    int cnt_h = 0;
+    int cnt_p = 0;
+
+    for (int i = 0; i < samples; i++) {
+        float t = 0.0f;
+        float h = 0.0f;
+        float p = 0.0f;
+
+        if (ESP_OK == bme280_read_temperature(bme280, &t)) {
+            sum_t += t;
+            cnt_t++;
+        }
+        usleep(50 * 1000);
+
+        if (ESP_OK == bme280_read_humidity(bme280, &h)) {
+            sum_h += h;
+            cnt_h++;
+        }
+        usleep(50 * 1000);
+
+        if (ESP_OK == bme280_read_pressure(bme280, &p)) {
+            sum_p += p;
+            cnt_p++;
+        }
+
+        if (inter_sample_delay_ms > 0 && i != (samples - 1)) {
+            usleep((useconds_t)inter_sample_delay_ms * 1000);
+        }
+    }
+
+    if (out_ok_temp != NULL) {
+        *out_ok_temp = (cnt_t > 0);
+    }
+    if (out_ok_hum != NULL) {
+        *out_ok_hum = (cnt_h > 0);
+    }
+    if (out_ok_press != NULL) {
+        *out_ok_press = (cnt_p > 0);
+    }
+
+    if (out_temperature_c != NULL) {
+        *out_temperature_c = (cnt_t > 0) ? (sum_t / cnt_t) : 0.0f;
+    }
+    if (out_humidity_pct != NULL) {
+        *out_humidity_pct = (cnt_h > 0) ? (sum_h / cnt_h) : 0.0f;
+    }
+    if (out_pressure_hpa != NULL) {
+        *out_pressure_hpa = (cnt_p > 0) ? (sum_p / cnt_p) : 0.0f;
+    }
+}
+
+static bool wait_for_wifi_connected(uint32_t timeout_ms)
+{
+    const int64_t start_us = esp_timer_get_time();
+    while (!s_wifi_connected) {
+        const int64_t elapsed_ms = (esp_timer_get_time() - start_us) / 1000;
+        if (elapsed_ms >= (int64_t)timeout_ms) {
+            break;
+        }
+        usleep(100 * 1000);
+    }
+    return s_wifi_connected;
+}
+
+void app_main() {
+    #if DEBUG_ENABLE_OUTPUT
+        // Wait for ~1 second to allow attaching the USB serial console.
+        usleep(1000 * 1000);
+    #endif
+
+    led_init_set_awake_state();
+
+    esp_err_t err = ESP_OK;
+    i2c_bus_handle_t i2c_bus = NULL;
+    bme280_handle_t bme280 = NULL;
+    bool wifi_started = false;
+    bool sent_ok = false;
+
+    // 1) Start connecting to Wi-Fi ASAP (event-driven; no user-created FreeRTOS tasks/event groups)
+    const int64_t wifi_start_us = esp_timer_get_time();
+    err = wifi_init_sta_from_secret();
+    if (err == ESP_OK) {
+        wifi_started = true;
+    } else {
+        // If Wi-Fi can't start, sleeping immediately is safest for battery.
+        DBG_LOGW(TAG, "Wi-Fi init failed: %s", esp_err_to_name(err));
+        goto cleanup_sleep;
+    }
     
     // Initialize I2C bus for BME280
     i2c_config_t conf = {
@@ -288,98 +513,113 @@ void app_main() {
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
         .master.clk_speed = I2C_MASTER_FREQ_HZ,
     };
-    i2c_bus_handle_t i2c_bus = i2c_bus_create(I2C_MASTER_NUM, &conf);
-    
-    // Initialize BME280 sensor
-    bme280_handle_t bme280 = bme280_create(i2c_bus, BME280_I2C_ADDRESS_DEFAULT);
-    esp_err_t init_result = bme280_default_init(bme280);
-    if (init_result != ESP_OK) {
-        printf("Failed to initialize BME280 sensor (%d)\n", (int)init_result);
-        return;
+    i2c_bus = i2c_bus_create(I2C_MASTER_NUM, &conf);
+    if (i2c_bus == NULL) {
+        DBG_LOGW(TAG, "i2c_bus_create failed");
+        goto cleanup_sleep;
     }
     
-    printf("LED %d blinking with BME280 readings\n", LED_GPIO);
+    // Initialize BME280 sensor
+    bme280 = bme280_create(i2c_bus, BME280_I2C_ADDRESS_DEFAULT);
+    if (bme280 == NULL) {
+        DBG_LOGW(TAG, "bme280_create failed");
+        goto cleanup_sleep;
+    }
+    err = bme280_default_init(bme280);
+    if (err != ESP_OK) {
+        DBG_LOGW(TAG, "bme280_default_init failed: %s", esp_err_to_name(err));
+        goto cleanup_sleep;
+    }
 
     // Initialize ADC sampling on IO0 / ADC1_CH0.
-    ESP_ERROR_CHECK(adc_gpio0_init());
+    err = adc_gpio0_init();
+    if (err != ESP_OK) {
+        DBG_LOGW(TAG, "ADC init failed: %s", esp_err_to_name(err));
+        // Not fatal; we can still send BME280 data.
+    }
 
-    size_t count = 0;
-    
-    // Blink LED and read sensor data
-    while (count < 10) {
-        // Turn LED on
-        gpio_set_level(LED_GPIO, 1);
-        
-        // Read sensor data
-        float temperature = 0.0, humidity = 0.0, pressure = 0.0;
-        bool ok_temp = false;
-        bool ok_hum = false;
-        bool ok_press = false;
-        float battery_v = 0.0f;
-        bool ok_batt = false;
-        
-        if (ESP_OK == bme280_read_temperature(bme280, &temperature)) {
-            printf("Temperature: %.2f °C\n", temperature);
-            ok_temp = true;
-        }
-        usleep(100000);  // 100ms delay
-        
-        if (ESP_OK == bme280_read_humidity(bme280, &humidity)) {
-            printf("Humidity: %.2f %%\n", humidity);
-            ok_hum = true;
-        }
-        usleep(100000);  // 100ms delay
-        
-        if (ESP_OK == bme280_read_pressure(bme280, &pressure)) {
-            printf("Pressure: %.2f hPa\n", pressure);
-            ok_press = true;
-        }
+    // 2) Sample BME280 a few times while Wi-Fi connects and average the results.
+    float temperature = 0.0f;
+    float humidity = 0.0f;
+    float pressure = 0.0f;
+    bool ok_temp = false;
+    bool ok_hum = false;
+    bool ok_press = false;
 
-        // Read the analog voltage on IO0 (ADC1_CH0).
+    bme280_read_avg(
+        bme280,
+        5,
+        200,
+        &temperature,
+        &ok_temp,
+        &humidity,
+        &ok_hum,
+        &pressure,
+        &ok_press);
+
+    if (ok_temp) {
+        DBG_PRINTF("Temperature(avg): %.2f C\n", temperature);
+    }
+    if (ok_hum) {
+        DBG_PRINTF("Humidity(avg): %.2f %%\n", humidity);
+    }
+    if (ok_press) {
+        DBG_PRINTF("Pressure(avg): %.2f hPa\n", pressure);
+    }
+
+    // 3) Sample ADC for battery voltage
+    float battery_v = 0.0f;
+    bool ok_batt = false;
+    {
         int adc_raw = 0;
         int adc_mv = 0;
         esp_err_t adc_err = adc_gpio0_read_voltage_mv(&adc_mv, &adc_raw);
         if (adc_err == ESP_OK) {
-            printf("ADC IO0 (ADC1_CH0): raw=%d, voltage=%d mV\n", adc_raw, adc_mv);
             battery_v = (adc_mv * 2) / 1000.0f;
             ok_batt = true;
-            printf("Battery voltage: %.2f V\n", battery_v);
+            DBG_PRINTF("ADC IO0: raw=%d, adc=%d mV, batt=%.2f V\n", adc_raw, adc_mv, battery_v);
         } else {
-            // Calibration may not be available on all builds; show raw in that case.
-            esp_err_t raw_err = adc_gpio0_read_raw(&adc_raw);
-            if (raw_err == ESP_OK) {
-                printf("ADC IO0 (ADC1_CH0): raw=%d (calibrated voltage unavailable: %s)\n",
-                       adc_raw, esp_err_to_name(adc_err));
-            } else {
-                printf("ADC IO0 (ADC1_CH0): read failed: %s\n", esp_err_to_name(raw_err));
-            }
+            // Calibration may not be available; keep low power behavior (skip battery_v).
+            (void)adc_gpio0_read_raw(&adc_raw);
+            DBG_PRINTF("ADC IO0: raw=%d (no calibrated voltage: %s)\n", adc_raw, esp_err_to_name(adc_err));
         }
-        
-        usleep(300000);  // 300ms delay
-        
-        // Turn LED off
-        gpio_set_level(LED_GPIO, 0);
-        usleep(500000);  // 500ms delay
-        
-        printf("LED toggled (count: %zu)\n\n", count + 1);
-        if (s_wifi_connected) {
-            ESP_LOGI(TAG, "Wi-Fi connected");
-        } else {
-            ESP_LOGI(TAG, "Wi-Fi not connected yet");
-        }
+    }
 
-        // On the 10th (final) reading, send telemetry to ThingSpeak.
-        if (count == 9) {
-            if (!s_wifi_connected) {
-                ESP_LOGW(TAG, "Skipping ThingSpeak update: Wi-Fi not connected");
-            } else if (!(ok_temp && ok_hum && ok_press && ok_batt)) {
-                ESP_LOGW(TAG, "Skipping ThingSpeak update: missing readings (t=%d h=%d p=%d batt=%d)",
-                         ok_temp, ok_hum, ok_press, ok_batt);
-            } else {
-                (void)thingspeak_send_readings(temperature, humidity, pressure, battery_v);
+    // 1/2 overlap) Wait for Wi-Fi connection up to a fixed timeout, including time spent sampling.
+    const uint32_t wifi_timeout_ms = 15000;
+    int64_t elapsed_ms = (esp_timer_get_time() - wifi_start_us) / 1000;
+    if (wifi_started && !s_wifi_connected && elapsed_ms < (int64_t)wifi_timeout_ms) {
+        (void)wait_for_wifi_connected((uint32_t)(wifi_timeout_ms - (uint32_t)elapsed_ms));
+    }
+
+    // 4/5) If Wi-Fi is established, send all successfully sampled fields in one go.
+    if (wifi_started && s_wifi_connected) {
+        const float *t_ptr = ok_temp ? &temperature : NULL;
+        const float *h_ptr = ok_hum ? &humidity : NULL;
+        const float *p_ptr = ok_press ? &pressure : NULL;
+        const float *b_ptr = ok_batt ? &battery_v : NULL;
+
+        if (t_ptr == NULL && h_ptr == NULL && p_ptr == NULL && b_ptr == NULL) {
+            DBG_LOGW(TAG, "No readings available to send");
+        } else {
+            for (int attempt = 0; attempt < 3; attempt++) {
+                esp_err_t send_err = thingspeak_send_readings_optional(t_ptr, h_ptr, p_ptr, b_ptr);
+                if (send_err == ESP_OK) {
+                    sent_ok = true;
+                    break;
+                }
+                DBG_LOGW(TAG, "ThingSpeak send failed (attempt %d/3): %s", attempt + 1, esp_err_to_name(send_err));
+
+                // Small delay before retry.
+                usleep(2000 * 1000);
+                if (!s_wifi_connected) {
+                    (void)esp_wifi_connect();
+                    (void)wait_for_wifi_connected(5000);
+                }
             }
         }
-        count++;
+    } else {
+        DBG_LOGW(TAG, "Wi-Fi not connected; skipping ThingSpeak update");
     }
 
     // Put BME280 into sleep mode before ESP deep sleep
@@ -391,16 +631,37 @@ void app_main() {
                                                  BME280_FILTER_OFF,
                                                  BME280_STANDBY_MS_0_5);
     if (sleep_result != ESP_OK) {
-        printf("Warning: failed to put BME280 into sleep mode (%d)\n", (int)sleep_result);
+        DBG_PRINTF("Warning: failed to put BME280 into sleep mode (%d)\n", (int)sleep_result);
     }
 
     // Clean up
-    bme280_delete(&bme280);
-    i2c_bus_delete(&i2c_bus);
+cleanup_sleep:
+    if (bme280 != NULL) {
+        // Put BME280 into sleep mode before ESP deep sleep
+        esp_err_t sleep_result = bme280_set_sampling(bme280,
+                                                     BME280_MODE_SLEEP,
+                                                     BME280_SAMPLING_NONE,
+                                                     BME280_SAMPLING_NONE,
+                                                     BME280_SAMPLING_NONE,
+                                                     BME280_FILTER_OFF,
+                                                     BME280_STANDBY_MS_0_5);
+        if (sleep_result != ESP_OK) {
+            DBG_PRINTF("Warning: failed to put BME280 into sleep mode (%d)\n", (int)sleep_result);
+        }
+        bme280_delete(&bme280);
+    }
+    if (i2c_bus != NULL) {
+        i2c_bus_delete(&i2c_bus);
+    }
     adc_gpio0_deinit();
 
-    // Go into deep sleep and wake back up after 10 seconds
-    printf("Entering deep sleep for 10 seconds...\n");
-    esp_deep_sleep(10 * 1000000); // Sleep for 10 seconds
-    printf("Woke up from deep sleep\n");
+    // Stop Wi-Fi to reduce power before entering deep sleep.
+    if (wifi_started) {
+        (void)esp_wifi_stop();
+    }
+
+    // 6) Sleep for 30 minutes.
+    DBG_PRINTF("Done (sent=%d). Sleeping for 30 minutes...\n", sent_ok);
+    gpio_set_level(LED_GPIO, 0);
+    esp_deep_sleep(30ULL * 60ULL * 1000000ULL);
 }
