@@ -45,12 +45,17 @@ static const char *TAG = "ESP_Meteo";
 // - When DEBUG_ENABLE_OUTPUT=0, all printf/ESP_LOG* are disabled in this file.
 // - When DEBUG_LED_SOLID_ON=1, the LED stays ON while the device is awake.
 //   When DEBUG_LED_SOLID_ON=0, the LED is kept OFF (no blinking).
+// - When DEBUG_DUMP_SENSOR=1, BME280 values are continuously printed for debugging
 #ifndef DEBUG_ENABLE_OUTPUT
 #define DEBUG_ENABLE_OUTPUT 0
 #endif
 
 #ifndef DEBUG_LED_SOLID_ON
 #define DEBUG_LED_SOLID_ON 0
+#endif
+
+#ifndef DEBUG_DUMP_SENSOR
+#define DEBUG_DUMP_SENSOR 0
 #endif
 
 #if DEBUG_ENABLE_OUTPUT
@@ -459,13 +464,13 @@ static void bme280_read_avg(
             sum_t += t;
             cnt_t++;
         }
-        usleep(50 * 1000);
+        usleep(100 * 1000);
 
         if (ESP_OK == bme280_read_humidity(bme280, &h)) {
             sum_h += h;
             cnt_h++;
         }
-        usleep(50 * 1000);
+        usleep(100 * 1000);
 
         if (ESP_OK == bme280_read_pressure(bme280, &p)) {
             sum_p += p;
@@ -516,8 +521,61 @@ void app_main() {
     enable_bme280_power();
 
     #if DEBUG_ENABLE_OUTPUT
-        // Wait for ~1 second to allow attaching the USB serial console.
-        usleep(10000 * 1000);
+        // Wait for ~5 seconds to allow attaching the USB serial console.
+        usleep(5000 * 1000);
+    #endif
+
+    #if DEBUG_DUMP_SENSOR
+        esp_err_t err_dbg = ESP_OK;
+        i2c_bus_handle_t i2c_bus_dbg = NULL;
+        bme280_handle_t bme280_dbg = NULL;
+        float temperature_dbg = 0.0f;
+        float humidity_dbg = 0.0f;
+        float pressure_dbg = 0.0f;
+        while(true){
+            enable_bme280_power();
+            // usleep(500 * 1000);
+            // Initialize I2C bus for BME280
+            i2c_config_t conf = {
+                .mode = I2C_MODE_MASTER,
+                .sda_io_num = I2C_MASTER_SDA_IO,
+                .sda_pullup_en = GPIO_PULLUP_ENABLE,
+                .scl_io_num = I2C_MASTER_SCL_IO,
+                .scl_pullup_en = GPIO_PULLUP_ENABLE,
+                .master.clk_speed = I2C_MASTER_FREQ_HZ,
+            };
+            i2c_bus_dbg = i2c_bus_create(I2C_MASTER_NUM, &conf);
+            if (i2c_bus_dbg == NULL) {
+                DBG_LOGW(TAG, "i2c_bus_create failed");
+            }
+            // Initialize BME280 sensor
+            bme280_dbg = bme280_create(i2c_bus_dbg, BME280_I2C_ADDRESS_DEFAULT);
+            if (bme280_dbg == NULL) {
+                DBG_LOGW(TAG, "bme280_create failed");
+            }
+            err_dbg = bme280_default_init(bme280_dbg);
+            if (err_dbg != ESP_OK) {
+                DBG_LOGW(TAG, "bme280_default_init failed: %s", esp_err_to_name(err_dbg));
+                bme280_delete(&bme280_dbg);
+            }
+            usleep(50 * 1000);
+            if (bme280_dbg != NULL) {
+                usleep(50 * 1000);
+                bme280_read_temperature(bme280_dbg, &temperature_dbg);
+                usleep(50 * 1000);
+                bme280_read_humidity(bme280_dbg, &humidity_dbg);
+                usleep(50 * 1000);
+                bme280_read_pressure(bme280_dbg, &pressure_dbg);
+                usleep(50 * 1000);
+                DBG_PRINTF("BME280: Temp=%.2f C, Hum=%.2f %%, Pres=%.2f hPa\n", temperature_dbg, humidity_dbg, pressure_dbg);
+            }
+
+            bme280_delete(&bme280_dbg);
+            i2c_bus_delete(&i2c_bus_dbg);
+
+            disable_bme280_power();
+            usleep(30000 * 1000);
+        }
     #endif
 
     #if DEBUG_LED_SOLID_ON
@@ -529,17 +587,6 @@ void app_main() {
     bme280_handle_t bme280 = NULL;
     bool wifi_started = false;
     bool sent_ok = false;
-
-    // 1) Start connecting to Wi-Fi ASAP (event-driven; no user-created FreeRTOS tasks/event groups)
-    const int64_t wifi_start_us = esp_timer_get_time();
-    err = wifi_init_sta_from_secret();
-    if (err == ESP_OK) {
-        wifi_started = true;
-    } else {
-        // If Wi-Fi can't start, sleeping immediately is safest for battery.
-        DBG_LOGW(TAG, "Wi-Fi init failed: %s", esp_err_to_name(err));
-        goto cleanup_sleep;
-    }
 
     // Initialize ADC sampling on IO0 / ADC1_CH0 as early as possible so we can
     // still report battery voltage even if BME280 init/read fails.
@@ -582,7 +629,8 @@ void app_main() {
         // Not fatal; we can still send battery voltage to ThingSpeak.
         goto after_bme_init;
     }
-    
+    // Give the BME some time to wake up
+    usleep(100 * 1000);
     // Initialize BME280 sensor
     bme280 = bme280_create(i2c_bus, BME280_I2C_ADDRESS_DEFAULT);
     if (bme280 == NULL) {
@@ -600,19 +648,20 @@ void app_main() {
 
 after_bme_init:
 
-    // 2) Sample BME280 a few times while Wi-Fi connects and average the results.
+    // 2) Sample BME280 before starting Wi-Fi to avoid voltage dropouts.
     float temperature = 0.0f;
     float humidity = 0.0f;
     float pressure = 0.0f;
     bool ok_temp = false;
     bool ok_hum = false;
     bool ok_press = false;
-
+    // BME needs some idle time before we can measure it
+    usleep(100 * 1000);
     if (bme280 != NULL) {
         bme280_read_avg(
             bme280,
-            5,
-            200,
+            1,
+            50,
             &temperature,
             &ok_temp,
             &humidity,
@@ -633,8 +682,19 @@ after_bme_init:
         DBG_PRINTF("Pressure(avg): %.2f hPa\n", pressure);
     }
 
+    // 1) Start connecting to Wi-Fi after everything is sampled
+    const int64_t wifi_start_us = esp_timer_get_time();
+    err = wifi_init_sta_from_secret();
+    if (err == ESP_OK) {
+        wifi_started = true;
+    } else {
+        // If Wi-Fi can't start, sleeping immediately is safest for battery.
+        DBG_LOGW(TAG, "Wi-Fi init failed: %s", esp_err_to_name(err));
+        goto cleanup_sleep;
+    }
+
     // 1/2 overlap) Wait for Wi-Fi connection up to a fixed timeout, including time spent sampling.
-    const uint32_t wifi_timeout_ms = 15000;
+    const uint32_t wifi_timeout_ms = 20000;
     int64_t elapsed_ms = (esp_timer_get_time() - wifi_start_us) / 1000;
     if (wifi_started && !s_wifi_connected && elapsed_ms < (int64_t)wifi_timeout_ms) {
         (void)wait_for_wifi_connected((uint32_t)(wifi_timeout_ms - (uint32_t)elapsed_ms));
@@ -673,17 +733,17 @@ after_bme_init:
     // Clean up
 cleanup_sleep:
     if (bme280 != NULL) {
-        // Put BME280 into sleep mode before ESP deep sleep
-        esp_err_t sleep_result = bme280_set_sampling(bme280,
-                                                     BME280_MODE_SLEEP,
-                                                     BME280_SAMPLING_NONE,
-                                                     BME280_SAMPLING_NONE,
-                                                     BME280_SAMPLING_NONE,
-                                                     BME280_FILTER_OFF,
-                                                     BME280_STANDBY_MS_0_5);
-        if (sleep_result != ESP_OK) {
-            DBG_PRINTF("Warning: failed to put BME280 into sleep mode (%d)\n", (int)sleep_result);
-        }
+        // Put BME280 into sleep mode before ESP deep sleep (redundant if we power off using GPIO).
+        // esp_err_t sleep_result = bme280_set_sampling(bme280,
+        //                                              BME280_MODE_SLEEP,
+        //                                              BME280_SAMPLING_NONE,
+        //                                              BME280_SAMPLING_NONE,
+        //                                              BME280_SAMPLING_NONE,
+        //                                              BME280_FILTER_OFF,
+        //                                              BME280_STANDBY_MS_0_5);
+        // if (sleep_result != ESP_OK) {
+        //     DBG_PRINTF("Warning: failed to put BME280 into sleep mode (%d)\n", (int)sleep_result);
+        // }
         bme280_delete(&bme280);
     }
     if (i2c_bus != NULL) {
@@ -693,7 +753,7 @@ cleanup_sleep:
 
     disable_bme280_power();
 
-    // Stop Wi-Fi to reduce power before entering deep sleep.
+    // Stop Wi-Fi before entering deep sleep.
     if (wifi_started) {
         (void)esp_wifi_stop();
     }
